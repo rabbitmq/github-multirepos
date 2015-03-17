@@ -1,0 +1,593 @@
+#!/usr/bin/env perl
+
+use strict;
+use warnings;
+
+use File::Basename;
+use Pithub;
+
+our $PROGRAM = basename($0);
+
+our $USER = $ENV{'GITHUB_USER'} || 'rabbitmq';
+our $REF_REPO = $ENV{'GITHUB_REF_REPO'} || 'rabbitmq-public-umbrella';
+
+our $TOKEN = $ENV{'GITHUB_TOKEN'} ||
+die 'Set $GITHUB_TOKEN to your Personal Authentication Token';
+
+# --------------------------------------------------------------------
+# Copied from Term::FormatColumns.
+# --------------------------------------------------------------------
+
+use List::Util qw( max );
+use List::MoreUtils qw( part each_arrayref );
+use POSIX qw( ceil );
+use Symbol qw(qualify_to_ref);
+
+# Find the length of a string as displayed on the terminal, ignoring any ANSI
+# escape sequences.
+sub _term_length {
+    my ( $str ) = @_;
+    $str =~ s/\x1b\[[0-9;]+m//g;
+    return length $str;
+}
+
+sub format_columns {
+    my ( $prefix, $term_width, @data ) = @_;
+    my $max_width = max map { _term_length( $_ ) } @data;
+    $max_width += 2; # make sure at least two spaces between data values
+    my $columns = int( $term_width / $max_width );
+    if ( $columns <= 1 ) {
+        # Only one column, let the terminal handle things
+        return join("\n", map { $prefix.$_ } @data)."\n";
+    }
+    my @lines = ();
+    my $output = '';
+    my $column_width = int( $term_width / $columns );
+    my $rows = ceil( @data / $columns );
+    push @data, ('') x ($rows * $columns - @data); # Pad data with empty strings
+    my @index = part { int( $_ / $rows ) } 0..$#data;
+    my $iter = each_arrayref @index;
+    while ( my @row_vals = $iter->() ) {
+        my @cells = map { $data[$_] } @row_vals;
+        my $last_cell = pop @cells;
+        for (@cells) {
+            my $length = _term_length( $_ );
+            $output .= $_;
+            $output .= ' ' x ($column_width - $length);
+        }
+        push(@lines, $output.$last_cell);
+        $output = '';
+    }
+    return join("\n", map { $prefix.$_ } @lines)."\n";
+}
+
+# --------------------------------------------------------------------
+# Copied from Text::Glob.
+# --------------------------------------------------------------------
+
+our $strict_leading_dot    = 1;
+our $strict_wildcard_slash = 1;
+
+sub glob_to_regex {
+    my $glob = shift;
+    my $regex = glob_to_regex_string($glob);
+    return qr/^$regex$/;
+}
+
+sub glob_to_regex_string
+{
+    my $glob = shift;
+    my ($regex, $in_curlies, $escaping);
+    local $_;
+    my $first_byte = 1;
+    for ($glob =~ m/(.)/gs) {
+        if ($first_byte) {
+            if ($strict_leading_dot) {
+                $regex .= '(?=[^\.])' unless $_ eq '.';
+            }
+            $first_byte = 0;
+        }
+        if ($_ eq '/') {
+            $first_byte = 1;
+        }
+        if ($_ eq '.' || $_ eq '(' || $_ eq ')' || $_ eq '|' ||
+            $_ eq '+' || $_ eq '^' || $_ eq '$' || $_ eq '@' || $_ eq '%' ) {
+            $regex .= "\\$_";
+        }
+        elsif ($_ eq '*') {
+            $regex .= $escaping ? "\\*" :
+            $strict_wildcard_slash ? "[^/]*" : ".*";
+        }
+        elsif ($_ eq '?') {
+            $regex .= $escaping ? "\\?" :
+            $strict_wildcard_slash ? "[^/]" : ".";
+        }
+        elsif ($_ eq '{') {
+            $regex .= $escaping ? "\\{" : "(";
+            ++$in_curlies unless $escaping;
+        }
+        elsif ($_ eq '}' && $in_curlies) {
+            $regex .= $escaping ? "}" : ")";
+            --$in_curlies unless $escaping;
+        }
+        elsif ($_ eq ',' && $in_curlies) {
+            $regex .= $escaping ? "," : "|";
+        }
+        elsif ($_ eq "\\") {
+            if ($escaping) {
+                $regex .= "\\\\";
+                $escaping = 0;
+            }
+            else {
+                $escaping = 1;
+            }
+            next;
+        }
+        else {
+            $regex .= $_;
+            $escaping = 0;
+        }
+        $escaping = 0;
+    }
+
+    return $regex;
+}
+
+sub match_glob {
+    my $glob = shift;
+    my $regex = glob_to_regex $glob;
+    local $_;
+    grep { $_ =~ $regex } @_;
+}
+
+# --------------------------------------------------------------------
+
+sub get_repos_list () {
+    my $repos = Pithub::Repos->new(
+        'token'           => $TOKEN,
+        'auto_pagination' => 1,
+    );
+
+    my $result = $repos->list(
+        'org' => $USER,
+    );
+
+    #my @repos = ();
+    while (my $row = $result->next) {
+        push(@repos, $row->{'name'});
+    }
+
+    printf("(%d repositories found)\n", scalar(@repos));
+    return sort @repos;
+}
+
+sub new_label_obj ($) {
+    my ($repo) = @_;
+
+    my $l = Pithub::Issues::Labels->new(
+        'user'  => $USER,
+        'repo'  => $repo,
+        'token' => $TOKEN,
+    );
+
+    return $l;
+}
+
+sub get_labels_list ($) {
+    my ($repo) = @_;
+
+    my $l = new_label_obj($repo);
+    my $result = $l->list();
+
+    my %labels = ();
+    while (my $row = $result->next) {
+        $labels{$row->{'name'}} = $row->{'color'};
+    }
+
+    return %labels;
+}
+
+sub get_issues_list ($@) {
+    my ($repo, @labels) = @_;
+
+    my %params = (
+        'user'            => $USER,
+        'token'           => $TOKEN,
+        'auto_pagination' => 1,
+    );
+    $params{'repo'} = $repo if ($repo);
+
+    my $i = Pithub::Issues->new(%params);
+    my $result = $i->list(
+        'params' => {
+            'filter' => 'all',
+            'state'  => 'all',
+            'labels' => join(',', @labels),
+        }
+    );
+
+    my @issues = ();
+    while (my $row = $result->next) {
+        push(@issues, $row);
+    }
+
+    return @issues;
+}
+
+sub glob_match (%) {
+    my (%args) = @_;
+
+    my @patterns = @{$args{'patterns'}};
+    my @items = @{$args{'items'}};
+
+    my %filtered_items = ();
+    foreach my $glob (@patterns) {
+        my $regex = glob_to_regex($glob);
+        foreach my $item (@items) {
+            $filtered_items{$item} = 1 if ($item =~ $regex);
+        }
+    }
+    return keys %filtered_items;
+}
+
+sub labels_list (%) {
+    my (%args) = @_;
+
+    my @repos = @{$args{'repos'}};
+    my $repos_count = scalar(@repos);
+    my %all_labels = ();
+
+    foreach my $repo (@repos) {
+        my %labels = get_labels_list($repo);
+
+        while (my ($name, $color) = each %labels) {
+            if (exists($all_labels{$name})) {
+                $all_labels{$name}{$repo} = $color;
+            } else {
+                $all_labels{$name} = {
+                    $repo => $color,
+                }
+            }
+        }
+    }
+
+    foreach my $name (sort keys %all_labels) {
+        my $issues_count = get_issues_list(undef, $name);
+        my $warnings = 0;
+
+        my $ref_color = exists($all_labels{$name}{$REF_REPO}) ?
+            $all_labels{$name}{$REF_REPO} : undef;
+        printf("\033[1m%-30s\033[0m  %7s  %5d issue(s)\n",
+            $name, $ref_color ? '#'.$ref_color : '', $issues_count);
+
+        if ($ref_color) {
+            my $colors_count = scalar(keys %{$all_labels{$name}});
+            if ($colors_count != $repos_count) {
+                printf("  \033[33mWARN\033[0m: ".
+                    "Missing from %d repositories:\n",
+                    $repos_count - $colors_count);
+                my @missing = grep { !exists($all_labels{$name}{$_}); } @repos;
+                print(format_columns('    ', 72, @missing));
+
+                $warnings += 1;
+            }
+
+            my %colors = ();
+            foreach my $color (values %{$all_labels{$name}}) {
+                if (exists($colors{$color})) {
+                    $colors{$color} += 1;
+                } else {
+                    $colors{$color} = 1;
+                }
+            }
+            my $different_colors = scalar(keys %colors);
+            if ($different_colors != 1) {
+                $warnings += 1;
+                printf("  \033[33mWARN\033[0m: Colors out-of-sync ".
+                    "(%d different colors)\n",
+                    $different_colors);
+            }
+        } else {
+            printf("  \033[33mWARN\033[0m: Missing from '%s', ".
+                "exists on %d repositories:\n",
+                $REF_REPO, scalar(keys %{$all_labels{$name}}));
+            my @cols = map { $_.'('.get_issues_list($_, $name).')' }
+                sort keys %{$all_labels{$name}};
+            print(format_columns('    ', 74, @cols));
+            $warnings += 1;
+        }
+
+        if ($warnings) {
+            print("\n");
+        }
+    }
+}
+
+sub labels_create (%) {
+    my (%args) = @_;
+
+    my @repos = @{$args{'repos'}};
+    my $name = $args{'name'};
+    my $color = $args{'color'};
+
+    print("Add label '$name' (color #$color) on:\n");
+
+    foreach my $repo (@repos) {
+        my %labels = get_labels_list($repo);
+
+        my $l = new_label_obj($repo);
+
+        if (exists($labels{$name})) {
+            printf("  %s (update existing label, old color: #%s\n",
+                $repo, $labels{$name});
+            $l->update(
+                'label' => $name,
+                'data' => {
+                    'name'  => $name,
+                    'color' => $color,
+                },
+            );
+        } else {
+            printf("  %s\n", $repo);
+            $l->create(
+                'data' => {
+                    'name'  => $name,
+                    'color' => $color,
+                },
+            );
+        }
+    }
+}
+
+sub labels_mv (%) {
+    my (%args) = @_;
+
+    my @repos = @{$args{'repos'}};
+    my $old = $args{'old'};
+    my $new = $args{'new'};
+
+    print("Rename label '$old' to '$new' on:\n");
+    foreach my $repo (@repos) {
+        my %labels = get_labels_list($repo);
+
+        next unless (exists($labels{$old}));
+
+        my $l = new_label_obj($repo);
+
+        if (exists($labels{$new})) {
+            printf("  %s (merge with existing label, color: #%s)\n",
+                $repo, $labels{$new});
+
+            my @issues = get_issues_list($repo, $old);
+            foreach my $issue (@issues) {
+                my %issue_labels = map {
+                    ($_->{'name'} eq $old ? $new : $_->{'name'}) => 1;
+                } @{$issue->{'labels'}};
+                my @issue_labels = keys %issue_labels;
+
+                $l->replace(
+                    'issue_id' => $issue->{'number'},
+                    'data' => \@issue_labels,
+                );
+            }
+            $l->delete(
+                'label' => $old,
+            );
+        } else {
+            printf("  %s (color: #%s)\n", $repo, $labels{$old});
+            $l->update(
+                'label' => $old,
+                'data'  => {
+                    'name'  => $new,
+                    'color' => $labels{$old},
+                }
+            );
+        }
+    }
+}
+
+sub labels_rm (%) {
+    my (%args) = @_;
+
+    my @repos = @{$args{'repos'}};
+
+    foreach my $repo (@repos) {
+        my %labels = get_labels_list($repo);
+
+        my @names = keys %labels;
+        @names = sort(glob_match(
+            'patterns' => $args{'names'},
+            'items'    => \@names,
+        ));
+        next if (scalar(@names) == 0);
+
+        printf("Remove labels on '%s':\n", $repo);
+        my $l = new_label_obj($repo);
+
+        foreach my $name (@names) {
+            next unless (exists($labels{$name}));
+
+            my $issues_count = get_issues_list($repo, $name);
+            if ($issues_count >= 1) {
+                printf("  \033[33mWARN\033[0m: %d issues in '%s' are still ".
+                    "tagged with label '%s'; label not removed\n",
+                    $issues_count, $repo, $name);
+                next;
+            }
+
+            printf("  %s (color: #%s)\n", $name, $labels{$name});
+            $l->delete(
+                'label' => $name,
+            );
+        }
+    }
+}
+
+sub labels_sync (%) {
+    my (%args) = @_;
+
+    my @repos = @{$args{'repos'}};
+
+    my %ref_labels = get_labels_list($REF_REPO);
+    my @names = keys %ref_labels;
+    my $sync_mode = 1;
+
+    if (exists($args{'names'})) {
+        $sync_mode = 0;
+        @names = sort(glob_match(
+            'patterns' => $args{'names'},
+            'items'    => \@names,
+        ));
+    }
+
+    foreach my $repo (@repos) {
+        next if ($repo eq $REF_REPO);
+
+        if ($sync_mode) {
+            printf("Sync repository '%s':\n", $repo);
+        }
+
+        my %labels = get_labels_list($repo);
+        my $l = new_label_obj($repo);
+
+        foreach my $name (@names) {
+            if (!exists($labels{$name})) {
+                if ($sync_mode) {
+                    printf("  Create label '%s' (color: #%s)\n",
+                        $name, $ref_labels{$name});
+                } else {
+                    printf("%s: Create label '%s' (color: #%s)\n",
+                        $repo, $name, $ref_labels{$name});
+                }
+
+                $l->create(
+                    'data' => {
+                        'name' => $name,
+                        'color' => $ref_labels{$name},
+                    }
+                );
+            } elsif ($labels{$name} ne $ref_labels{$name}) {
+                if ($sync_mode) {
+                    printf("  Update label '%s' (color: #%s -> #%s)\n",
+                        $name, $labels{$name}, $ref_labels{$name});
+                } else {
+                    printf("%s: Update label '%s' (color: #%s -> #%s)\n",
+                        $repo, $name, $labels{$name}, $ref_labels{$name});
+                }
+
+                $l->update(
+                    'label' => $name,
+                    'data' => {
+                        'name' => $name,
+                        'color' => $ref_labels{$name},
+                    }
+                );
+            }
+        }
+
+        if ($sync_mode) {
+            foreach my $name (keys %labels) {
+                next if (exists($ref_labels{$name}));
+
+                my $issues_count = get_issues_list($repo, $name);
+                if ($issues_count >= 1) {
+                    printf("  \033[33mWARN\033[0m: %d issues in '%s' are ".
+                        "still tagged with label '%s'; label not removed\n",
+                        $issues_count, $repo, $name);
+                    next;
+                }
+
+                printf("  Remove label '%s' (color: #%s)\n",
+                    $name, $labels{$name});
+
+                $l->delete(
+                    'label' => $name,
+                );
+            }
+        }
+    }
+}
+
+sub labels ($@) {
+    my ($command, @args) = @_;
+
+    my @repos = get_repos_list();
+
+    if (!defined($command) || $command eq 'list') {
+        labels_list(
+            'repos' => \@repos,
+        )
+    } elsif ($command eq 'create') {
+        my ($name, $color) = @args;
+
+        unless ($name && $color) {
+            print STDERR "Syntax: $PROGRAM labels create <name> <color>\n";
+            return 0;
+        }
+
+        labels_create(
+            'repos' => \@repos,
+            'name'  => $name,
+            'color' => $color,
+        );
+    } elsif ($command eq 'cp') {
+        unless (scalar(@args) >= 1) {
+            print STDERR "Syntax: $PROGRAM labels cp <name> ...\n";
+            return 0;
+        }
+
+        labels_sync(
+            'repos' => \@repos,
+            'names' => \@args,
+        );
+    } elsif ($command eq 'mv') {
+        my ($old, $new) = @args;
+
+        unless ($old && $new) {
+            print STDERR "Syntax: $PROGRAM labels mv <old_name> <new_name>\n";
+            return 0;
+        }
+
+        labels_mv(
+            'repos' => \@repos,
+            'old'   => $old,
+            'new'   => $new,
+        );
+    } elsif ($command eq 'rm') {
+        my ($name) = @args;
+
+        unless (scalar(@args) >= 1) {
+            print STDERR "Syntax: $PROGRAM labels rm <name> ...\n";
+            return 0;
+        }
+
+        labels_rm(
+            'repos' => \@repos,
+            'names' => \@args,
+        );
+    } elsif ($command eq 'sync') {
+        labels_sync(
+            'repos' => \@repos,
+        );
+    }
+
+    return 0;
+}
+
+sub main {
+    my ($command, @args) = @_;
+
+    if (!defined($command)) {
+        print STDERR "Syntax: $PROGRAM <command>\n";
+        return 0;
+    } elsif ($command eq 'labels') {
+        labels(@args);
+    } else {
+        print STDERR "Syntax: $PROGRAM <command>\n";
+        return 0;
+    }
+}
+
+unless (main(@ARGV)) {
+    exit(1);
+}
