@@ -141,8 +141,28 @@ sub match_glob {
 }
 
 # --------------------------------------------------------------------
+# Generic functions.
+# --------------------------------------------------------------------
 
-sub get_repos_list () {
+sub glob_match (%) {
+    my (%args) = @_;
+
+    my @patterns = @{$args{'patterns'}};
+    my @items = @{$args{'items'}};
+
+    my %filtered_items = ();
+    foreach my $glob (@patterns) {
+        my $regex = glob_to_regex($glob);
+        foreach my $item (@items) {
+            $filtered_items{$item} = 1 if ($item =~ $regex);
+        }
+    }
+    return keys %filtered_items;
+}
+
+sub get_repos_list (%) {
+    my (%conds) = @_;
+
     my $repos = Pithub::Repos->new(
         'token'           => $TOKEN,
         'auto_pagination' => 1,
@@ -152,14 +172,58 @@ sub get_repos_list () {
         'org' => $USER,
     );
 
-    #my @repos = ();
+    my @repos = ();
+    my $repos_count = 0;
     while (my $row = $result->next) {
+        $repos_count++;
+        if (exists($conds{'has_issues'})) {
+            next if ($conds{'has_issues'} != $row->{'has_issues'});
+        }
         push(@repos, $row->{'name'});
     }
 
-    printf("(%d repositories found)\n", scalar(@repos));
+    printf("(%d/%d repositories selected)\n", scalar(@repos), $repos_count);
     return sort @repos;
 }
+
+sub new_issues_obj ($) {
+    my ($repo) = @_;
+
+    my %params = (
+        'user'            => $USER,
+        'token'           => $TOKEN,
+        'auto_pagination' => 1,
+    );
+    $params{'repo'} = $repo if ($repo);
+
+    my $i = Pithub::Issues->new(%params);
+
+    return $i;
+}
+
+sub get_issues_list ($@) {
+    my ($repo, @labels) = @_;
+
+    my $i = new_issues_obj($repo);
+    my $result = $i->list(
+        'params' => {
+            'filter' => 'all',
+            'state'  => 'all',
+            'labels' => join(',', @labels),
+        }
+    );
+
+    my @issues = ();
+    while (my $row = $result->next) {
+        push(@issues, $row);
+    }
+
+    return @issues;
+}
+
+# --------------------------------------------------------------------
+# Labels.
+# --------------------------------------------------------------------
 
 sub new_label_obj ($) {
     my ($repo) = @_;
@@ -185,49 +249,6 @@ sub get_labels_list ($) {
     }
 
     return %labels;
-}
-
-sub get_issues_list ($@) {
-    my ($repo, @labels) = @_;
-
-    my %params = (
-        'user'            => $USER,
-        'token'           => $TOKEN,
-        'auto_pagination' => 1,
-    );
-    $params{'repo'} = $repo if ($repo);
-
-    my $i = Pithub::Issues->new(%params);
-    my $result = $i->list(
-        'params' => {
-            'filter' => 'all',
-            'state'  => 'all',
-            'labels' => join(',', @labels),
-        }
-    );
-
-    my @issues = ();
-    while (my $row = $result->next) {
-        push(@issues, $row);
-    }
-
-    return @issues;
-}
-
-sub glob_match (%) {
-    my (%args) = @_;
-
-    my @patterns = @{$args{'patterns'}};
-    my @items = @{$args{'items'}};
-
-    my %filtered_items = ();
-    foreach my $glob (@patterns) {
-        my $regex = glob_to_regex($glob);
-        foreach my $item (@items) {
-            $filtered_items{$item} = 1 if ($item =~ $regex);
-        }
-    }
-    return keys %filtered_items;
 }
 
 sub labels_list (%) {
@@ -318,7 +339,7 @@ sub labels_create (%) {
         my $l = new_label_obj($repo);
 
         if (exists($labels{$name})) {
-            printf("  %s (update existing label, old color: #%s\n",
+            printf("  %s (update existing label, old color: #%s)\n",
                 $repo, $labels{$name});
             $l->update(
                 'label' => $name,
@@ -508,10 +529,10 @@ sub labels_sync (%) {
     }
 }
 
-sub labels ($@) {
+sub labels (@) {
     my ($command, @args) = @_;
 
-    my @repos = get_repos_list();
+    my @repos = get_repos_list('has_issues' => 1);
 
     if (!defined($command) || $command eq 'list') {
         labels_list(
@@ -521,7 +542,7 @@ sub labels ($@) {
         my ($name, $color) = @args;
 
         unless ($name && $color) {
-            print STDERR "Syntax: $PROGRAM labels create <name> <color>\n";
+            print STDERR "Syntax: $PROGRAM labels $command <name> <color>\n";
             return 0;
         }
 
@@ -532,7 +553,7 @@ sub labels ($@) {
         );
     } elsif ($command eq 'cp') {
         unless (scalar(@args) >= 1) {
-            print STDERR "Syntax: $PROGRAM labels cp <name> ...\n";
+            print STDERR "Syntax: $PROGRAM labels $command <name> ...\n";
             return 0;
         }
 
@@ -544,7 +565,7 @@ sub labels ($@) {
         my ($old, $new) = @args;
 
         unless ($old && $new) {
-            print STDERR "Syntax: $PROGRAM labels mv <old_name> <new_name>\n";
+            print STDERR "Syntax: $PROGRAM labels $command <old_name> <new_name>\n";
             return 0;
         }
 
@@ -554,10 +575,8 @@ sub labels ($@) {
             'new'   => $new,
         );
     } elsif ($command eq 'rm') {
-        my ($name) = @args;
-
         unless (scalar(@args) >= 1) {
-            print STDERR "Syntax: $PROGRAM labels rm <name> ...\n";
+            print STDERR "Syntax: $PROGRAM labels $command <name> ...\n";
             return 0;
         }
 
@@ -571,8 +590,455 @@ sub labels ($@) {
         );
     }
 
-    return 0;
+    return 1;
 }
+
+# --------------------------------------------------------------------
+# Milestones.
+# --------------------------------------------------------------------
+
+our @MILESTONES_ATTRS = (
+    'description',
+    'due_on',
+    'state',
+);
+
+sub new_milestone_obj ($) {
+    my ($repo) = @_;
+
+    my $m = Pithub::Issues::Milestones->new(
+        'user'  => $USER,
+        'repo'  => $repo,
+        'token' => $TOKEN,
+    );
+
+    return $m;
+}
+
+sub get_milestones_list ($) {
+    my ($repo) = @_;
+
+    my $m = new_milestone_obj($repo);
+    my $result = $m->list(
+        'params' => {
+            'state' => 'all',
+        },
+    );
+    return () unless ($result->success());
+
+    my %milestones = ();
+    while (my $row = $result->next) {
+        $milestones{$row->{'title'}} = {
+            'number'       => $row->{'number'},
+            'description'  => $row->{'description'} || undef,
+            'due_on'       => $row->{'due_on'} || undef,
+            'state'        => $row->{'state'},
+            'issues_count' => 0,
+        };
+
+        if (exists($row->{'open_issues'})) {
+            $milestones{$row->{'title'}}{'issues_count'} +=
+                $row->{'open_issues'};
+        }
+        if (exists($row->{'closed_issues'})) {
+            $milestones{$row->{'title'}}{'issues_count'} +=
+                $row->{'closed_issues'};
+        }
+    }
+
+    return %milestones;
+}
+
+sub milestones_list (%) {
+    my (%args) = @_;
+
+    my @repos = @{$args{'repos'}};
+    my $repos_count = scalar(@repos);
+    my %all_milestones = ();
+
+    foreach my $repo (@repos) {
+        my %milestones = get_milestones_list($repo);
+
+        while (my ($title, $attrs) = each %milestones) {
+            if (exists($all_milestones{$title})) {
+                $all_milestones{$title}{$repo} = $attrs;
+            } else {
+                $all_milestones{$title} = {
+                    $repo => $attrs,
+                }
+            }
+        }
+    }
+
+    foreach my $title (sort keys %all_milestones) {
+        my $warnings = 0;
+        my $issues_count = 0;
+        foreach my $attrs (values %{$all_milestones{$title}}) {
+            $issues_count += $attrs->{'issues_count'};
+        }
+
+        my $ref_attrs = exists($all_milestones{$title}{$REF_REPO}) ?
+            $all_milestones{$title}{$REF_REPO} : undef;
+        printf("\033[1m%-30s\033[0m  %20s  %-6s  %5d issue(s)\n",
+            $title,
+            $ref_attrs && $ref_attrs->{'due_on'} ? $ref_attrs->{'due_on'} : '',
+            $ref_attrs ? $ref_attrs->{'state'} : '', $issues_count);
+
+        if ($ref_attrs) {
+            my $attrs_count = scalar(keys %{$all_milestones{$title}});
+            if ($attrs_count != $repos_count) {
+                printf("  \033[33mWARN\033[0m: ".
+                    "Missing from %d repositories:\n",
+                    $repos_count - $attrs_count);
+                my @missing = grep {
+                    !exists($all_milestones{$title}{$_});
+                } @repos;
+                print(format_columns('    ', 72, @missing));
+
+                $warnings += 1;
+            }
+
+            foreach my $attr_name (@MILESTONES_ATTRS) {
+                my %attr_values = ();
+                foreach my $attrs (values %{$all_milestones{$title}}) {
+                    my $attr = $attrs->{$attr_name} || '';
+                    if (exists($attr_values{$attr})) {
+                        $attr_values{$attr} += 1;
+                    } else {
+                        $attr_values{$attr} = 1;
+                    }
+                }
+                my $different_values = scalar(keys %attr_values);
+                if ($different_values != 1) {
+                    $warnings += 1;
+                    printf("  \033[33mWARN\033[0m: '%s' out-of-sync ".
+                        "(%d different values)\n",
+                        $attr_name, $different_values);
+                }
+            }
+        } else {
+            printf("  \033[33mWARN\033[0m: Missing from '%s', ".
+                "exists on %d repositories:\n",
+                $REF_REPO, scalar(keys %{$all_milestones{$title}}));
+            my @cols = map { $_.'('.get_issues_list($_, $title).')' }
+                sort keys %{$all_milestones{$title}};
+            print(format_columns('    ', 74, @cols));
+            $warnings += 1;
+        }
+
+        if ($warnings) {
+            print("\n");
+        }
+    }
+}
+
+sub milestones_update (%) {
+    my (%args) = @_;
+
+    my @repos = @{$args{'repos'}};
+    my $title = $args{'title'};
+    my $new_title = $args{'new_title'} || '';
+
+    print("Create or update milestone '$title' on:\n");
+
+    foreach my $repo (@repos) {
+        my %milestones = get_milestones_list($repo);
+
+        my $m = new_milestone_obj($repo);
+
+        my %data = ();
+        $data{'title'} = $new_title if ($new_title);
+        foreach my $name (@MILESTONES_ATTRS) {
+            $data{$name} = $args{$name} if (exists($args{$name}));
+        }
+
+        if (exists($milestones{$title}) &&
+            $new_title && exists($milestones{$new_title})) {
+            # Both 'old' and 'new' milestones exist: we must merge them.
+            printf("  %s (merge with existing '%s')\n",
+                $repo, $new_title);
+
+            my $i = new_issues_obj($repo);
+            my @issues = get_issues_list($repo);
+            foreach my $issue (@issues) {
+                next unless (defined($issue->{'milestone'}));
+                next if ($issue->{'milestone'}{'title'} ne $title);
+
+                $i->update(
+                    'issue_id' => $issue->{'number'},
+                    'data'     => {
+                        'milestone' => $milestones{$new_title}{'number'},
+                    }
+                );
+            }
+
+            $m->delete(
+                'milestone_id' => $milestones{$title}{'number'},
+            );
+        } elsif (exists($milestones{$title})) {
+            # Only the 'old' milestone exists: we update its attributes,
+            # including its 'new' title if any.
+            printf("  %s (update existing milestone)\n",
+                $repo, $milestones{$title});
+
+            $m->update(
+                'milestone_id' => $milestones{$title}{'number'},
+                'data'         => \%data,
+            );
+        } elsif (exists($args{'create'}) && $args{'create'}) {
+            # The 'old' milestone doesn't exist: we create it (if asked)
+            # with the specified attributes, including the 'new' title if
+            # any.
+            printf("  %s\n", $repo);
+            $data{'title'} = $new_title || $args{'title'};
+            $m->create(
+                'data' => \%data,
+            );
+        }
+    }
+}
+
+sub milestones_rm (%) {
+    my (%args) = @_;
+
+    my @repos = @{$args{'repos'}};
+
+    foreach my $repo (@repos) {
+        my %milestones = get_milestones_list($repo);
+
+        my @titles = keys %milestones;
+        @titles = sort(glob_match(
+            'patterns' => $args{'titles'},
+            'items'    => \@titles,
+        ));
+        next if (scalar(@titles) == 0);
+
+        printf("Remove milestones on '%s':\n", $repo);
+        my $m = new_milestone_obj($repo);
+
+        foreach my $title (@titles) {
+            next unless (exists($milestones{$title}));
+
+            if ($milestones{$title}{'issues_count'} >= 1) {
+                printf("  \033[33mWARN\033[0m: %d issues in '%s' are still ".
+                    "associated to milestone '%s'; milestone not removed\n",
+                    $milestones{$title}{'issues_count'}, $repo, $title);
+                next;
+            }
+
+            printf("  %s\n", $title);
+            $m->delete(
+                'milestone_id' => $milestones{$title}{'number'},
+            );
+        }
+    }
+}
+
+sub milestones_sync (%) {
+    my (%args) = @_;
+
+    my @repos = @{$args{'repos'}};
+
+    my %ref_milestones = get_milestones_list($REF_REPO);
+    my @titles = keys %ref_milestones;
+    my $sync_mode = 1;
+
+    if (exists($args{'titles'})) {
+        $sync_mode = 0;
+        @titles = sort(glob_match(
+            'patterns' => $args{'titles'},
+            'items'    => \@titles,
+        ));
+    }
+
+    foreach my $repo (@repos) {
+        next if ($repo eq $REF_REPO);
+
+        if ($sync_mode) {
+            printf("Sync repository '%s':\n", $repo);
+        }
+
+        my %milestones = get_milestones_list($repo);
+        my $m = new_milestone_obj($repo);
+
+        foreach my $title (@titles) {
+            my %data = (
+                'title' => $title,
+            );
+            foreach my $attr_name (@MILESTONES_ATTRS) {
+                $data{$attr_name} = $ref_milestones{$title}{$attr_name} || undef;
+            };
+
+            if (!exists($milestones{$title})) {
+                if ($sync_mode) {
+                    printf("  Create milestone '%s'\n", $title);
+                } else {
+                    printf("%s: Create milestone '%s'\n", $repo, $title);
+                }
+
+                $m->create(
+                    'data' => \%data,
+                );
+            } else {
+                my $equal = 1;
+                foreach my $attr_name (@MILESTONES_ATTRS) {
+                    if ((defined($data{$attr_name}) !=
+                         defined($milestones{$title}{$attr_name})) ||
+                        (defined($data{$attr_name}) &&
+                         $data{$attr_name} ne
+                         $milestones{$title}{$attr_name})) {
+                        $equal = 0;
+                        last;
+                    }
+                }
+                next if ($equal);
+
+                if ($sync_mode) {
+                    printf("  Update milestone '%s'\n", $title);
+                } else {
+                    printf("%s: Update milestone '%s'\n", $repo, $title);
+                }
+
+                $m->update(
+                    'milestone_id' => $milestones{$title}{'number'},
+                    'data'         => \%data,
+                );
+            }
+        }
+
+        if ($sync_mode) {
+            foreach my $title (keys %milestones) {
+                next if (exists($ref_milestones{$title}));
+
+                if ($milestones{$title}{'issues_count'} >= 1) {
+                    printf("  \033[33mWARN\033[0m: %d issues in '%s' are ".
+                        "still associated to milestone '%s'; milestone not ".
+                        "removed\n",
+                        $milestones{$title}{'issues_count'}, $repo, $title);
+                    next;
+                }
+
+                printf("  Remove milestone '%s'\n", $title);
+
+                $m->delete(
+                    'milestone_id' => $milestones{$title}{'number'},
+                );
+            }
+        }
+    }
+}
+
+sub milestones (@) {
+    my ($command, @args) = @_;
+
+    my @repos = get_repos_list('has_issues' => 1);
+
+    if (!defined($command) || $command eq 'list') {
+        milestones_list(
+            'repos' => \@repos,
+        )
+    } elsif ($command eq 'create') {
+        my ($title, $date, $desc) = @args;
+
+        unless ($title) {
+            print STDERR "Syntax: $PROGRAM milestones $command <title> ".
+                "[<due> [<desc>]]\n";
+            return 0;
+        }
+
+        milestones_update(
+            'repos'       => \@repos,
+            'title'       => $title,
+            'due'         => $date,
+            'description' => $desc,
+            'create'      => 1,
+        );
+    } elsif ($command eq 'cp') {
+        unless (scalar(@args) >= 1) {
+            print STDERR "Syntax: $PROGRAM milestones $command <title> ...\n";
+            return 0;
+        }
+
+        milestones_sync(
+            'repos'  => \@repos,
+            'titles' => \@args,
+        );
+    } elsif ($command eq 'mv') {
+        my ($old, $new) = @args;
+
+        unless ($old && $new) {
+            print STDERR "Syntax: $PROGRAM milestones $command <old> <new>\n";
+            return 0;
+        }
+
+        milestones_update(
+            'repos'     => \@repos,
+            'title'     => $old,
+            'new_title' => $new,
+            'create'    => 0,
+        );
+    } elsif ($command eq 'desc') {
+        my ($title, $desc) = @args;
+
+        unless ($title) {
+            print STDERR "Syntax: $PROGRAM milestones $command <title> <desc>\n";
+            return 0;
+        }
+
+        milestones_update(
+            'repos'       => \@repos,
+            'title'       => $title,
+            'description' => $desc || undef,
+            'create'      => 0,
+        );
+    } elsif ($command eq 'due') {
+        my ($title, $date) = @args;
+
+        unless ($title) {
+            print STDERR "Syntax: $PROGRAM milestones $command <title> <date>\n";
+            return 0;
+        }
+
+        milestones_update(
+            'repos'  => \@repos,
+            'title'  => $title,
+            'due_on' => $date || undef,
+            'create' => 0,
+        );
+    } elsif ($command eq 'open' || $command eq 'close') {
+        my ($title) = @args;
+
+        unless ($title) {
+            print STDERR "Syntax: $PROGRAM milestones $command <title>\n";
+            return 0;
+        }
+
+        milestones_update(
+            'repos'  => \@repos,
+            'title'  => $title,
+            'state'  => ($command eq 'open') ? 'open' : 'closed',
+            'create' => 0,
+        );
+    } elsif ($command eq 'rm') {
+        unless (scalar(@args) >= 1) {
+            print STDERR "Syntax: $PROGRAM milestones $command <title> ...\n";
+            return 0;
+        }
+
+        milestones_rm(
+            'repos'  => \@repos,
+            'titles' => \@args,
+        );
+    } elsif ($command eq 'sync') {
+        milestones_sync(
+            'repos'  => \@repos,
+        );
+    }
+
+    return 1;
+}
+
+# --------------------------------------------------------------------
 
 sub main {
     my ($command, @args) = @_;
@@ -582,6 +1048,8 @@ sub main {
         return 0;
     } elsif ($command eq 'labels') {
         labels(@args);
+    } elsif ($command eq 'milestones') {
+        milestones(@args);
     } else {
         print STDERR "Syntax: $PROGRAM <command>\n";
         return 0;
