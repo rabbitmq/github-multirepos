@@ -209,8 +209,8 @@ sub new_issues_obj ($) {
     return $i;
 }
 
-sub get_issues_list ($@) {
-    my ($repo, @labels) = @_;
+sub get_issues_list ($;$@) {
+    my ($repo, $milestone, @labels) = @_;
 
     my $i = new_issues_obj($repo);
     my $result = $i->list(
@@ -223,6 +223,15 @@ sub get_issues_list ($@) {
 
     my @issues = ();
     while (my $row = $result->next) {
+        if (defined($milestone)) {
+            if (!$milestone && defined($row->{'milestone'})) {
+                next;
+            } elsif ($milestone && (
+              !defined($row->{'milestone'}) ||
+              $milestone ne $row->{'milestone'}{'title'})) {
+                next;
+            }
+        }
         push(@issues, $row);
     }
 
@@ -281,7 +290,7 @@ sub labels_list (%) {
     }
 
     foreach my $name (sort keys %all_labels) {
-        my $issues_count = get_issues_list(undef, $name);
+        my $issues_count = get_issues_list(undef, undef, $name);
         my $warnings = 0;
 
         my $ref_color = exists($all_labels{$name}{$REF_REPO}) ?
@@ -320,7 +329,7 @@ sub labels_list (%) {
             printf("  \033[33mWARN\033[0m: Missing from '%s', ".
                 "exists on %d repositories:\n",
                 $REF_REPO, scalar(keys %{$all_labels{$name}}));
-            my @cols = map { $_.'('.get_issues_list($_, $name).')' }
+            my @cols = map { $_.'('.get_issues_list($_, undef, $name).')' }
                 sort keys %{$all_labels{$name}};
             print(format_columns('    ', 74, @cols));
             $warnings += 1;
@@ -387,7 +396,7 @@ sub labels_mv (%) {
             printf("  %s (merge with existing label, color: #%s)\n",
                 $repo, $labels{$new});
 
-            my @issues = get_issues_list($repo, $old);
+            my @issues = get_issues_list($repo, undef, $old);
             foreach my $issue (@issues) {
                 my %issue_labels = map {
                     ($_->{'name'} eq $old ? $new : $_->{'name'}) => 1;
@@ -436,7 +445,7 @@ sub labels_rm (%) {
         foreach my $name (@names) {
             next unless (exists($labels{$name}));
 
-            my $issues_count = get_issues_list($repo, $name);
+            my $issues_count = get_issues_list($repo, undef, $name);
             if ($issues_count >= 1) {
                 printf("  \033[33mWARN\033[0m: %d issues in '%s' are still ".
                     "tagged with label '%s'; label not removed\n",
@@ -518,7 +527,7 @@ sub labels_sync (%) {
             foreach my $name (keys %labels) {
                 next if (exists($ref_labels{$name}));
 
-                my $issues_count = get_issues_list($repo, $name);
+                my $issues_count = get_issues_list($repo, undef, $name);
                 if ($issues_count >= 1) {
                     printf("  \033[33mWARN\033[0m: %d issues in '%s' are ".
                         "still tagged with label '%s'; label not removed\n",
