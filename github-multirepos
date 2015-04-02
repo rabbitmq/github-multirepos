@@ -14,6 +14,11 @@ our $REF_REPO = $ENV{'GITHUB_REF_REPO'} || 'rabbitmq-public-umbrella';
 our $TOKEN = $ENV{'GITHUB_TOKEN'} ||
 die 'Set $GITHUB_TOKEN to your Personal Authentication Token';
 
+# Projects we don't want to manage.
+our @BLACKLISTED_PROJECTS = (
+    'hop'
+);
+
 # --------------------------------------------------------------------
 # Copied from Term::FormatColumns.
 # --------------------------------------------------------------------
@@ -176,9 +181,12 @@ sub get_repos_list (%) {
     my $repos_count = 0;
     while (my $row = $result->next) {
         $repos_count++;
+
         if (exists($conds{'has_issues'})) {
             next if ($conds{'has_issues'} != $row->{'has_issues'});
         }
+        next if grep { $_ eq $row->{'name'} } @BLACKLISTED_PROJECTS;
+
         push(@repos, $row->{'name'});
     }
 
