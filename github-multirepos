@@ -165,35 +165,6 @@ sub glob_match (%) {
     return keys %filtered_items;
 }
 
-sub get_repos_list (%) {
-    my (%conds) = @_;
-
-    my $repos = Pithub::Repos->new(
-        'token'           => $TOKEN,
-        'auto_pagination' => 1,
-    );
-
-    my $result = $repos->list(
-        'org' => $USER,
-    );
-
-    my @repos = ();
-    my $repos_count = 0;
-    while (my $row = $result->next) {
-        $repos_count++;
-
-        if (exists($conds{'has_issues'})) {
-            next if ($conds{'has_issues'} != $row->{'has_issues'});
-        }
-        next if grep { $_ eq $row->{'name'} } @BLACKLISTED_PROJECTS;
-
-        push(@repos, $row->{'name'});
-    }
-
-    printf("(%d/%d repositories selected)\n", scalar(@repos), $repos_count);
-    return sort @repos;
-}
-
 sub new_issues_obj ($) {
     my ($repo) = @_;
 
@@ -236,6 +207,90 @@ sub get_issues_list ($;$@) {
     }
 
     return @issues;
+}
+
+# --------------------------------------------------------------------
+# Repositories.
+# --------------------------------------------------------------------
+
+sub new_repo_obj ($) {
+    my ($repo) = @_;
+
+    my $r = Pithub::Repos->new(
+        'user'  => $USER,
+        'token' => $TOKEN,
+    );
+
+    return $r;
+}
+
+sub get_repos_list (%) {
+    my (%args) = @_;
+
+    my $repos = Pithub::Repos->new(
+        'token'           => $TOKEN,
+        'auto_pagination' => 1,
+    );
+
+    my $result = $repos->list(
+        'org' => $USER,
+    );
+
+    my @repos = ();
+    my $repos_count = 0;
+    while (my $row = $result->next) {
+        $repos_count++;
+
+        if (exists($args{'has_issues'})) {
+            next if ($args{'has_issues'} != $row->{'has_issues'});
+        }
+
+        if (!exists($args{'keep_blacklisted'}) || !$args{'keep_blacklisted'}) {
+            next if grep { $_ eq $row->{'name'} } @BLACKLISTED_PROJECTS;
+        }
+
+        if (exists($args{'detailed'}) && $args{'detailed'}) {
+            push(@repos, $row);
+        } else {
+            push(@repos, $row->{'name'});
+        }
+    }
+
+    printf("(%d/%d repositories selected)\n", scalar(@repos), $repos_count);
+    return sort @repos;
+}
+
+sub repos_list (%) {
+    my (%args) = @_;
+
+    my @repos = @{$args{'repos'}};
+
+    my $width = 0;
+    foreach my $repo (@repos) {
+        my $length = length($repo->{'name'});
+        $width = $length if $length > $width;
+    }
+
+    foreach my $repo (sort { $a->{'name'} cmp $b->{'name'} } @repos) {
+        printf("%-${width}s %s\n", $repo->{'name'}, $repo->{'ssh_url'});
+    }
+}
+
+sub repos (@) {
+    my ($command, @args) = @_;
+
+    my @repos = get_repos_list(
+        'keep_blacklisted' => 1,
+        'detailed'         => 1,
+    );
+
+    if (!defined($command) || $command eq 'list') {
+        repos_list(
+            'repos' => \@repos,
+        )
+    }
+
+    return 1;
 }
 
 # --------------------------------------------------------------------
@@ -1063,6 +1118,8 @@ sub main {
     if (!defined($command)) {
         print STDERR "Syntax: $PROGRAM <command>\n";
         return 0;
+    } elsif ($command eq 'repos') {
+        repos(@args);
     } elsif ($command eq 'labels') {
         labels(@args);
     } elsif ($command eq 'milestones') {
