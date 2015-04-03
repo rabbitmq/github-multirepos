@@ -1021,7 +1021,7 @@ sub milestones (@) {
         milestones_update(
             'repos'       => \@repos,
             'title'       => $title,
-            'due'         => $date,
+            'due_on'      => $date,
             'description' => $desc,
             'create'      => 1,
         );
