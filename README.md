@@ -1,6 +1,15 @@
 # Usage
 
-Currently, only operations on labels and milestones are supported.
+Currently, only operations on repositories, labels and milestones are supported.
+
+## Repositories
+
+### List repositories
+
+Example:
+```sh
+github-multirepos repos
+```
 
 ## Labels
 
