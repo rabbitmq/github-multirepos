@@ -850,8 +850,7 @@ sub milestones_update (%) {
         } elsif (exists($milestones{$title})) {
             # Only the 'old' milestone exists: we update its attributes,
             # including its 'new' title if any.
-            printf("  %s (update existing milestone)\n",
-                $repo, $milestones{$title});
+            printf("  %s (update existing milestone)\n", $repo);
 
             $m->update(
                 'milestone_id' => $milestones{$title}{'number'},
